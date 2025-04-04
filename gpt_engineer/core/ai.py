@@ -7,6 +7,7 @@ backoff strategies for handling rate limit errors from the OpenAI API.
 
 Classes:
     AI: A class that interfaces with language models for conversation management and message serialization.
+    ModelRegistry: A class that manages different LLM providers and their configurations.
 
 Functions:
     serialize_messages(messages: List[Message]) -> str
@@ -18,9 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import backoff
 import openai
@@ -46,6 +48,71 @@ Message = Union[AIMessage, HumanMessage, SystemMessage]
 # Set up logging
 logger = logging.getLogger(__name__)
 
+@dataclass
+class ModelConfig:
+    """Configuration for a language model."""
+    name: str
+    provider: str
+    temperature: float = 0.1
+    max_tokens: Optional[int] = None
+    streaming: bool = True
+    azure_endpoint: Optional[str] = None
+    vision: bool = False
+
+class ModelProvider(ABC):
+    """Abstract base class for model providers."""
+    
+    @abstractmethod
+    def create_model(self, config: ModelConfig) -> BaseChatModel:
+        """Create a model instance with the given configuration."""
+        pass
+
+class OpenAIProvider(ModelProvider):
+    """Provider for OpenAI models."""
+    
+    def create_model(self, config: ModelConfig) -> BaseChatModel:
+        if config.azure_endpoint:
+            return AzureChatOpenAI(
+                azure_endpoint=config.azure_endpoint,
+                model_name=config.name,
+                temperature=config.temperature,
+                streaming=config.streaming,
+            )
+        return ChatOpenAI(
+            model_name=config.name,
+            temperature=config.temperature,
+            streaming=config.streaming,
+        )
+
+class AnthropicProvider(ModelProvider):
+    """Provider for Anthropic models."""
+    
+    def create_model(self, config: ModelConfig) -> BaseChatModel:
+        return ChatAnthropic(
+            model_name=config.name,
+            temperature=config.temperature,
+            streaming=config.streaming,
+        )
+
+class ModelRegistry:
+    """Registry for managing different LLM providers."""
+    
+    def __init__(self):
+        self.providers: Dict[str, ModelProvider] = {
+            "openai": OpenAIProvider(),
+            "anthropic": AnthropicProvider(),
+        }
+    
+    def get_provider(self, provider_name: str) -> ModelProvider:
+        """Get a provider by name."""
+        if provider_name not in self.providers:
+            raise ValueError(f"Unknown provider: {provider_name}")
+        return self.providers[provider_name]
+    
+    def create_model(self, config: ModelConfig) -> BaseChatModel:
+        """Create a model instance with the given configuration."""
+        provider = self.get_provider(config.provider)
+        return provider.create_model(config)
 
 class AI:
     """
@@ -56,33 +123,14 @@ class AI:
 
     Attributes
     ----------
-    temperature : float
-        The temperature setting for the language model.
-    azure_endpoint : str
-        The endpoint URL for the Azure-hosted language model.
-    model_name : str
-        The name of the language model to use.
-    streaming : bool
-        A flag indicating whether to use streaming for the language model.
+    model_config : ModelConfig
+        The configuration for the language model.
+    registry : ModelRegistry
+        The registry for managing different LLM providers.
     llm : BaseChatModel
         The language model instance for conversation management.
     token_usage_log : TokenUsageLog
         A log for tracking token usage during conversations.
-
-    Methods
-    -------
-    start(system: str, user: str, step_name: str) -> List[Message]
-        Start the conversation with a system message and a user message.
-    next(messages: List[Message], prompt: Optional[str], step_name: str) -> List[Message]
-        Advances the conversation by sending message history to LLM and updating with the response.
-    backoff_inference(messages: List[Message]) -> Any
-        Perform inference using the language model with an exponential backoff strategy.
-    serialize_messages(messages: List[Message]) -> str
-        Serialize a list of messages to a JSON string.
-    deserialize_messages(jsondictstr: str) -> List[Message]
-        Deserialize a JSON string to a list of messages.
-    _create_chat_model() -> BaseChatModel
-        Create a chat model with the specified model name and temperature.
     """
 
     def __init__(
@@ -92,6 +140,7 @@ class AI:
         azure_endpoint=None,
         streaming=True,
         vision=False,
+        provider="openai",
     ):
         """
         Initialize the AI class.
@@ -99,23 +148,29 @@ class AI:
         Parameters
         ----------
         model_name : str, optional
-            The name of the model to use, by default "gpt-4".
+            The name of the language model to use, by default "gpt-4-turbo"
         temperature : float, optional
-            The temperature to use for the model, by default 0.1.
+            The temperature setting for the language model, by default 0.1
+        azure_endpoint : str, optional
+            The endpoint URL for the Azure-hosted language model, by default None
+        streaming : bool, optional
+            A flag indicating whether to use streaming for the language model, by default True
+        vision : bool, optional
+            A flag indicating whether to use vision capabilities, by default False
+        provider : str, optional
+            The provider of the language model, by default "openai"
         """
-        self.temperature = temperature
-        self.azure_endpoint = azure_endpoint
-        self.model_name = model_name
-        self.streaming = streaming
-        self.vision = (
-            ("vision-preview" in model_name)
-            or ("gpt-4-turbo" in model_name and "preview" not in model_name)
-            or ("claude" in model_name)
+        self.model_config = ModelConfig(
+            name=model_name,
+            provider=provider,
+            temperature=temperature,
+            azure_endpoint=azure_endpoint,
+            streaming=streaming,
+            vision=vision,
         )
+        self.registry = ModelRegistry()
         self.llm = self._create_chat_model()
         self.token_usage_log = TokenUsageLog(model_name)
-
-        logger.debug(f"Using model {self.model_name}")
 
     def start(self, system: str, user: Any, *, step_name: str) -> List[Message]:
         """
@@ -237,54 +292,44 @@ class AI:
             "\n".join([m.pretty_repr() for m in messages]),
         )
 
-        if not self.vision:
+        if not self.model_config.vision:
             messages = self._collapse_text_messages(messages)
 
         response = self.backoff_inference(messages)
 
         self.token_usage_log.update_log(
-            messages=messages, answer=response.content, step_name=step_name
+            messages=messages, answer=response, step_name=step_name
         )
-        messages.append(response)
+        messages.append(AIMessage(content=response))
         logger.debug(f"Chat completion finished: {messages}")
 
         return messages
 
-    @backoff.on_exception(backoff.expo, openai.RateLimitError, max_tries=7, max_time=45)
-    def backoff_inference(self, messages):
+    @backoff.on_exception(
+        backoff.expo,
+        (Exception,),  # Handle all exceptions for now
+        max_tries=5,
+        max_time=30,
+    )
+    def backoff_inference(self, messages: List[Message]) -> str:
         """
-        Perform inference using the language model while implementing an exponential backoff strategy.
+        Perform inference with exponential backoff for rate limits and API errors.
 
-        This function will retry the inference in case of a rate limit error from the OpenAI API.
-        It uses an exponential backoff strategy, meaning the wait time between retries increases
-        exponentially. The function will attempt to retry up to 7 times within a span of 45 seconds.
+        Args:
+            messages: List of messages to process.
 
-        Parameters
-        ----------
-        messages : List[Message]
-            A list of chat messages which will be passed to the language model for processing.
+        Returns:
+            str: The model's response.
 
-        callbacks : List[Callable]
-            A list of callback functions that are triggered after each inference. These functions
-            can be used for logging, monitoring, or other auxiliary tasks.
-
-        Returns
-        -------
-        Any
-            The output from the language model after processing the provided messages.
-
-        Raises
-        ------
-        openai.error.RateLimitError
-            If the number of retries exceeds the maximum or if the rate limit persists beyond the
-            allotted time, the function will ultimately raise a RateLimitError.
-
-        Example
-        -------
-        >>> messages = [SystemMessage(content="Hello"), HumanMessage(content="How's the weather?")]
-        >>> response = backoff_inference(messages)
+        Raises:
+            Exception
+                If there is an error during inference.
         """
-        return self.llm.invoke(messages)  # type: ignore
+        try:
+            return self.llm.invoke(messages).content
+        except Exception as e:
+            logger.error(f"Error during inference: {e}")
+            raise
 
     @staticmethod
     def serialize_messages(messages: List[Message]) -> str:
@@ -329,54 +374,28 @@ class AI:
 
     def _create_chat_model(self) -> BaseChatModel:
         """
-        Create a chat model with the specified model name and temperature.
-
-        Parameters
-        ----------
-        model : str
-            The name of the model to create.
-        temperature : float
-            The temperature to use for the model.
+        Create a chat model with the specified configuration.
 
         Returns
         -------
         BaseChatModel
-            The created chat model.
+            The created chat model instance.
+
+        Raises
+        ------
+        ValueError
+            If the model configuration is invalid.
+        RuntimeError
+            If there is an error creating the chat model.
         """
-        if self.azure_endpoint:
-            return AzureChatOpenAI(
-                azure_endpoint=self.azure_endpoint,
-                openai_api_version=os.getenv(
-                    "OPENAI_API_VERSION", "2024-05-01-preview"
-                ),
-                deployment_name=self.model_name,
-                openai_api_type="azure",
-                streaming=self.streaming,
-                callbacks=[StreamingStdOutCallbackHandler()],
-            )
-        elif "claude" in self.model_name:
-            return ChatAnthropic(
-                model=self.model_name,
-                temperature=self.temperature,
-                callbacks=[StreamingStdOutCallbackHandler()],
-                streaming=self.streaming,
-                max_tokens_to_sample=4096,
-            )
-        elif self.vision:
-            return ChatOpenAI(
-                model=self.model_name,
-                temperature=self.temperature,
-                streaming=self.streaming,
-                callbacks=[StreamingStdOutCallbackHandler()],
-                max_tokens=4096,  # vision models default to low max token limits
-            )
-        else:
-            return ChatOpenAI(
-                model=self.model_name,
-                temperature=self.temperature,
-                streaming=self.streaming,
-                callbacks=[StreamingStdOutCallbackHandler()],
-            )
+        try:
+            return self.registry.create_model(self.model_config)
+        except ValueError as e:
+            logger.error(f"Invalid model configuration: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error creating chat model: {e}")
+            raise RuntimeError(f"Failed to create chat model: {e}")
 
 
 def serialize_messages(messages: List[Message]) -> str:
@@ -386,7 +405,14 @@ def serialize_messages(messages: List[Message]) -> str:
 class ClipboardAI(AI):
     # Ignore not init superclass
     def __init__(self, **_):  # type: ignore
-        self.vision = False
+        self.model_config = ModelConfig(
+            name="clipboard_llm",
+            provider="openai",
+            temperature=0.1,
+            streaming=True,
+            vision=False,
+        )
+        self.registry = ModelRegistry()
         self.token_usage_log = TokenUsageLog("clipboard_llm")
 
     @staticmethod
